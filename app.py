@@ -1,4 +1,3 @@
-# app.py (fixed)
 import os
 import sys
 import json
@@ -6,10 +5,9 @@ import traceback
 from datetime import datetime
 from typing import Optional, List
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, render_template
 from pydantic import BaseModel, Field, ValidationError
 
-# ---- OpenAI SDK ----
 from openai import OpenAI
 from openai import (
     APIConnectionError,
@@ -24,14 +22,19 @@ from openai import (
     InternalServerError,
 )
 
-# -------------- Logging helpers --------------
-def jlog(level: str, event: str, **kwargs):
-    payload = {"ts": datetime.now().isoformat(timespec="seconds"), "level": level, "event": event}
-    payload.update(kwargs)
+# =========================
+# JSON-Lines logger (stdout: info, stderr: warn/error)
+# =========================
+def jlog(level: str, event: str, **kwargs) -> None:
+    rec = {"ts": datetime.now().isoformat(timespec="seconds"), "level": level, "event": event}
+    rec.update(kwargs)
     stream = sys.stderr if level in ("warn", "error") else sys.stdout
-    print(json.dumps(payload, ensure_ascii=False), file=stream, flush=True)
+    print(json.dumps(rec, ensure_ascii=False), file=stream, flush=True)
 
-# -------------- Pydantic schemas for Structured Outputs --------------
+
+# =========================
+# Pydantic models (structured outputs schema)
+# =========================
 class HeroSection(BaseModel):
     title: str = Field(description="ページのヒーロー見出し。AWS構文っぽいが固有名詞はパロディ名に合わせる")
     subtitle: str = Field(description="短いサブキャッチ。誇張と安心感の両立を狙う")
@@ -58,139 +61,158 @@ class ServiceSpec(BaseModel):
     faq: List[str] = Field(description="よくある質問と答えを交互に1要素ずつ。例: 'Q: ...', 'A: ...' の配列")
     disclaimers: List[str] = Field(description="注意書き・パロディである旨・非公式である旨")
 
-# -------------- OpenAI client wrapper --------------
-class LLMClient:
-    def __init__(self, model: Optional[str] = None, temperature: float = 0.4, max_output_tokens: int = 1200):
-        self.client = OpenAI()
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        self.temperature = float(os.getenv("OPENAI_TEMPERATURE", temperature))
-        self.max_output_tokens = int(os.getenv("OPENAI_MAX_TOKENS", max_output_tokens))
 
-    def _build_messages(self, prompt: str, lang: str, tone: str):
-        system = (
-            "You are a senior technical writer trained on AWS product docs. "
-            "Write STRICTLY in the requested language and tone. "
-            "Return ONLY the structured data as requested by schema, without extra text."
-        )
-        # developer/system style messages (chat.completions)
-        messages = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "task": "Generate an AWS-style parody product page content using the given keyword.",
-                        "keyword": prompt,
-                        "language": lang,
-                        "tone": tone,
-                        "constraints": [
-                            "No real AWS trademark misuse; keep it parody.",
-                            "Keep descriptions crisp and product-doc-ish.",
-                            "Feature names feel cloud-native.",
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-        return messages
-
-    def generate(self, prompt: str, lang: str = "ja", tone: str = "standard") -> ServiceSpec:
-        jlog("info", "openai.request", api="chat.completions", model=self.model, temperature=self.temperature, max_output_tokens=self.max_output_tokens)
-
-        messages = self._build_messages(prompt, lang, tone)
-
-        # ---- Path A: Pydantic-native Structured Outputs (parse) ----
-        try:
-            # Try the non-beta 'parse' first (newer SDKs). If missing, fall back to beta then to create().
-            if hasattr(self.client.chat.completions, "parse"):
-                comp = self.client.chat.completions.parse(  # type: ignore[attr-defined]
-                    model=self.model,
-                    messages=messages,
-                    temperature=self.temperature,
-                    max_output_tokens=self.max_output_tokens,
-                    response_format=ServiceSpec,  # Pydantic model
-                )
-                parsed: ServiceSpec = comp.choices[0].message.parsed  # type: ignore[assignment]
-                jlog("info", "openai.response", path="chat.completions.parse", finish_reason=getattr(comp.choices[0], "finish_reason", None), usage=getattr(comp, "usage", None))
-                return parsed
-        except Exception as e:
-            # Log and continue to Path B
-            jlog("warn", "openai.parse.fallback", reason=str(e), tb=traceback.format_exc())
-
-        # ---- Path B: JSON Schema via response_format (create) ----
-        # Build strict JSON Schema from Pydantic model (OpenAI SDK will accept JSON schema dict)
-        schema = {
-            "name": "aws_parody_spec",
-            "strict": True,
-            "schema": ServiceSpec.model_json_schema(),  # includes field descriptions
-        }
-
-        try:
-            cc = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                max_output_tokens=self.max_output_tokens,
-                response_format={"type": "json_schema", "json_schema": schema},
-            )
-            raw = cc.choices[0].message.content
-            jlog("info", "openai.response", path="chat.completions.create", finish_reason=cc.choices[0].finish_reason, usage=getattr(cc, "usage", None))
-            data = json.loads(raw or "{}")
-            # Validate with Pydantic for extra safety
-            return ServiceSpec.model_validate(data)
-        except (APIStatusError, BadRequestError, UnprocessableEntityError) as e:
-            # LLMリクエストの構文・スキーマ不一致など
-            jlog("error", "openai.error.request", kind=e.__class__.__name__, status=getattr(e, "status_code", None), message=str(e))
-            raise
-        except (RateLimitError, ConflictError) as e:
-            jlog("error", "openai.error.limit", kind=e.__class__.__name__, message=str(e))
-            raise
-        except (APITimeoutError, APIConnectionError, InternalServerError, NotFoundError) as e:
-            jlog("error", "openai.error.transport", kind=e.__class__.__name__, message=str(e))
-            raise
-        except OpenAIError as e:
-            jlog("error", "openai.error.generic", kind=e.__class__.__name__, message=str(e))
-            raise
-        except Exception as e:
-            jlog("error", "openai.error.unexpected", message=str(e), trace=traceback.format_exc())
-            raise
-
-# -------------- Flask app --------------
+# =========================
+# Flask app
+# =========================
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-llm = LLMClient()
+
+
+def get_openai_client() -> OpenAI:
+    """Create OpenAI client with explicit API key check (no crash on import)."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        # ここで投げずに上位で整形メッセージを返す
+        raise OpenAIError("OPENAI_API_KEY is not set")
+    return OpenAI(api_key=api_key)
+
+
+def build_messages(keyword: str, lang: str, tone: str) -> list:
+    """System+User messages. Keep it simple; schemaが拘束を担う。"""
+    system = (
+        "You are a senior AWS-style technical writer. "
+        "Write STRICTLY in the requested language and tone. "
+        "Return ONLY a JSON object matching the provided JSON Schema. No preface."
+    )
+    user_payload = {
+        "task": "Generate an AWS-style parody product page content using the given keyword.",
+        "keyword": keyword,
+        "language": lang,
+        "tone": tone,
+        "constraints": [
+            "No real AWS trademark misuse; keep it parody.",
+            "Keep descriptions crisp and product-doc-ish.",
+            "Feature names feel cloud-native."
+        ],
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+    ]
+
+
+def make_json_schema() -> dict:
+    """
+    Build the JSON Schema used by Structured Outputs.
+    Per official docs, use response_format={type:'json_schema', json_schema:{name, schema, strict:true}}
+    """
+    return {
+        "name": "aws_parody_spec",
+        "schema": ServiceSpec.model_json_schema(),  # 各フィールドのdescription付き
+        "strict": True,  # スキーマ順守を強制
+    }
+
 
 @app.route("/")
 def index():
-    return send_from_directory("static", "index.html")
+    # 静的トップ (任意で templates に置き換え可)
+    return render_template("index.html")
+
 
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
     try:
         body = request.get_json(force=True) or {}
-        prompt = str(body.get("keyword") or body.get("prompt") or "").strip()
-        lang = str(body.get("lang") or "ja")
-        tone = str(body.get("tone") or "standard")
-        if not prompt:
-            return jsonify({"error": "keyword is required"}), 400
+        keyword = str(body.get("keyword") or body.get("term") or body.get("prompt") or "").strip()
+        lang = str(body.get("lang") or "ja").strip().lower()
+        tone = str(body.get("tone") or "standard").strip().lower()
 
-        jlog("info", "http.request", path=request.path, method=request.method, lang=lang, tone=tone)
-        spec: ServiceSpec = llm.generate(prompt, lang=lang, tone=tone)
+        if not keyword:
+            return jsonify({"error": "keyword is required"}), 400
+        if lang not in ("ja", "en"):
+            return jsonify({"error": "lang must be 'ja' or 'en'"}), 400
+        if tone not in ("standard", "overkill"):
+            return jsonify({"error": "tone must be 'standard' or 'overkill'"}), 400
+
+        jlog("info", "http.request", path="/api/generate", method="POST", lang=lang, tone=tone)
+
+        # OpenAI 呼び出し
+        client = get_openai_client()
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-2024-08-06")  # 公式でStructured Outputs対応が明確なモデルに設定
+        temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.4"))
+        max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "1200"))
+
+        messages = build_messages(keyword, lang, tone)
+        response_format = {"type": "json_schema", "json_schema": make_json_schema()}
+
+        jlog("info", "openai.request", api="chat.completions", model=model,
+             temperature=temperature, max_tokens=max_tokens)
+
+        comp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,           # Chat Completions は max_tokens
+            response_format=response_format, # Structured Outputs (json_schema + strict)
+            # 参考：function callingと併用する場合は parallel_tool_calls: false も検討
+        )
+
+        choice = comp.choices[0]
+        raw = choice.message.content or ""
+        jlog("info", "openai.response",
+             finish_reason=getattr(choice, "finish_reason", None),
+             usage=getattr(comp, "usage", None))
+
+        # 期待値は“素のJSON”。念のためフェンスを剥がす処理を入れる
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            if text.endswith("```"):
+                text = text[:-3]
+        data = json.loads(text)
+
+        # 追加バリデーション（安心の二段ロック）
+        spec = ServiceSpec.model_validate(data)
         return jsonify(spec.model_dump(mode="json"))
-    except ValidationError as ve:
-        jlog("error", "server.error.validation", errors=json.loads(ve.json()))
-        return jsonify({"error": "ValidationError", "details": json.loads(ve.json())}), 422
-    except (BadRequestError, UnprocessableEntityError) as e:
-        return jsonify({"error": "OpenAIRequestError", "message": str(e)}), 400
-    except RateLimitError as e:
-        return jsonify({"error": "RateLimitError", "message": str(e)}), 429
-    except (APITimeoutError, APIConnectionError, InternalServerError, NotFoundError, ConflictError) as e:
-        return jsonify({"error": e.__class__.__name__, "message": str(e)}), 502
+
     except OpenAIError as e:
+        # APIキー未設定を含むSDKレベルの例外
+        jlog("error", "openai.error", message=str(e), trace=traceback.format_exc())
+        if "OPENAI_API_KEY" in str(e):
+            return jsonify({"error": "OPENAI_API_KEY is not set. Please export it before running the server."}), 500
         return jsonify({"error": "OpenAIError", "message": str(e)}), 502
+
+    except RateLimitError as e:
+        # RateLimitError は APIStatusError のサブクラス。順序に注意。
+        jlog("error", "openai.error.rate_limit", message=str(e))
+        return jsonify({"error": "RateLimitError", "message": str(e)}), 429
+
+    except (BadRequestError, UnprocessableEntityError) as e:
+        # スキーマ不一致などで 400/422
+        jlog("error", "openai.error.request", message=str(e))
+        return jsonify({"error": "RequestError", "message": str(e)}), 400
+
+    except (APITimeoutError, APIConnectionError, InternalServerError, NotFoundError, ConflictError) as e:
+        jlog("error", "openai.error.transport", kind=e.__class__.__name__, message=str(e))
+        return jsonify({"error": e.__class__.__name__, "message": str(e)}), 502
+
+    except APIStatusError as e:
+        # その他のHTTPステータス
+        jlog("error", "openai.error.status", status_code=getattr(e, "status_code", None), message=str(e))
+        return jsonify({"error": "APIStatusError", "message": str(e)}), 502
+
+    except ValidationError as e:
+        jlog("error", "server.error.validation", errors=json.loads(e.json()))
+        return jsonify({"error": "ValidationError", "details": json.loads(e.json())}), 422
+
+    except json.JSONDecodeError as e:
+        jlog("error", "server.error.json_decode", message=str(e))
+        return jsonify({"error": "JSONDecodeError", "message": str(e)}), 502
+
     except Exception as e:
         jlog("error", "server.error.unexpected", message=str(e), trace=traceback.format_exc())
         return jsonify({"error": "UnexpectedError", "message": str(e)}), 502
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
