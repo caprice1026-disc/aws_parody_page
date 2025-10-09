@@ -140,7 +140,7 @@ def api_generate():
         client = get_openai_client()
         model = os.getenv("OPENAI_MODEL", "gpt-4o-2024-08-06")  # 公式でStructured Outputs対応が明確なモデルに設定
         temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.4"))
-        max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "1200"))
+        max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "4096"))  # Chat Completions は max_tokens
 
         messages = build_messages(keyword, lang, tone)
         response_format = {"type": "json_schema", "json_schema": make_json_schema()}
