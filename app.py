@@ -1,230 +1,278 @@
 import os
+import sys
 import json
 import re
-from typing import List, Optional
+import time
+import traceback
+from typing import List
 
 from flask import Flask, render_template, request, jsonify
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 
-# .env 読み込み（なければスキップ）
+# .env 読み込み
 load_dotenv()
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-# OpenAI クライアントはオプション。未インストールでも動くように遅延 import。
-OPENAI_AVAILABLE = True
-try:
-    from openai import OpenAI  # openai>=1.x の想定
-except Exception:
-    OPENAI_AVAILABLE = False
+# OpenAI SDK（Responses API + Structured Outputs を使用）
+from openai import OpenAI
+from openai import (
+    APIStatusError,        # ステータスコード付き例外（401/404/5xx など）
+    APITimeoutError,       # タイムアウト
+    APIConnectionError,    # 接続エラー
+    RateLimitError,        # レート制限
+    OpenAIError,           # 上記に該当しない SDK 例外の親
+)
 
+# =========================
+#  ログ（sys 直書き・JSON Lines）
+# =========================
+
+def _log(level: str, event: str, **fields):
+    '''関数の説明
+    JSON-Lines で STDOUT/STDERR に出力するシンプルなロガー。
+    '''
+    rec = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "level": level,
+        "event": event,
+        **fields,
+    }
+    stream = sys.stderr if level == "error" else sys.stdout
+    print(json.dumps(rec, ensure_ascii=False), file=stream, flush=True)
+
+
+# =========================
+#  Pydantic モデル（出力スキーマ）
+# =========================
 
 class FAQ(BaseModel):
-    """FAQ の 1 項目を表現する Pydantic モデル"""
-    q: str = Field(..., description="質問文")
-    a: str = Field(..., description="回答文")
-
+    '''関数の説明
+    FAQの1項目（Q/A）。
+    '''
+    q: str = Field(..., description="FAQの質問文。ユーザー視点の具体的な問い。")
+    a: str = Field(..., description="FAQの回答文。簡潔で実用的な説明。")
 
 class ServiceSpec(BaseModel):
-    """LLM から返ってくる（返させる）サービス仕様 JSON の形式"""
-    service_name: str = Field(..., description="サービス名（例: AWS Elastic Coffee Pod）")
-    tagline: str = Field(..., description="短いキャッチコピー")
-    summary: str = Field(..., description="冒頭の要約（AWS構文）")
-    highlights: List[str] = Field(default_factory=list, description="トップの箇条書きハイライト（3〜5個）")
-    features: List[str] = Field(default_factory=list, description="主な機能（AWS構文）")
-    integrations: List[str] = Field(default_factory=list, description="連携サービス名のリスト")
-    getting_started: List[str] = Field(default_factory=list, description="導入手順のステップ")
-    pricing: List[str] = Field(default_factory=list, description="価格体系の説明箇条書き")
-    sample_cli: str = Field(..., description="CLI 例（コードブロックなし生テキスト）")
-    faqs: List[FAQ] = Field(default_factory=list, description="FAQ の配列")
+    '''関数の説明
+    パロディAWSサービスの構造化仕様。
+    '''
+    service_name: str = Field(..., description="サービス名。例: AWS Elastic <Term> / Amazon <Term> Service など、AWS風の命名。")
+    tagline: str = Field(..., description="短いキャッチコピー。1行で価値を伝える。")
+    summary: str = Field(..., description="冒頭の要約。AWS構文（完全マネージド/スケーラブル/セキュア/高可用/シームレス統合）。")
+    highlights: List[str] = Field(default_factory=list, description="トップの箇条書きハイライト（3〜5個）。最も重要な便益を短文で。")
+    features: List[str] = Field(default_factory=list, description="主な機能（5〜7個）。AWS構文で機能を列挙。")
+    integrations: List[str] = Field(default_factory=list, description="統合サービスのリスト（IAM, VPC, CloudWatch, ALB, Lambda, S3, RDS, KMS, ECR 等の“っぽい”名前）。")
+    getting_started: List[str] = Field(default_factory=list, description="導入手順（4〜7ステップ）。アカウント有効化から初回デプロイまで。")
+    pricing: List[str] = Field(default_factory=list, description="料金の概要（3〜5項目）。無料枠の有無や課金単位も含む。")
+    sample_cli: str = Field(..., description="CLI例。バッククォート無しの1つのテキスト。")
+    faqs: List[FAQ] = Field(default_factory=list, description="FAQ配列。3〜5項目。")
 
+
+# =========================
+#  JSON Schema（Structured Outputs 用）
+# =========================
+
+def build_service_spec_json_schema(lang: str) -> dict:
+    '''関数の説明
+    Responses API の Structured Outputs で使用する JSON Schema（厳格）を構築する。
+    '''
+    object_desc = (
+        "AWSの公式製品ページ風パロディの構造化出力。"
+        "各フィールドはAWS構文（完全マネージド/スケーラブル/セキュア/高可用/シームレス統合）の文体で記述する。"
+        f"出力言語: {'日本語' if lang == 'ja' else 'English'}。"
+    )
+    return {
+        "name": "service_spec",
+        "strict": True,  # スキーマ準拠を強制（Structured Outputs）
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "description": object_desc,
+            "properties": {
+                "service_name": {
+                    "type": "string",
+                    "description": "サービス名。例: AWS Elastic <Term> / Amazon <Term> Service。商標表記は避けて“風”の命名でも可。"
+                },
+                "tagline": {
+                    "type": "string",
+                    "description": "短いキャッチ。1文で価値を要約（誇張は控えめにリアル寄せ）。"
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "冒頭概要。完全マネージド・スケーラブル・セキュア・高可用・統合を強調。"
+                },
+                "highlights": {
+                    "type": "array",
+                    "description": "トップの便益サマリ。3〜5項目。",
+                    "minItems": 3,
+                    "maxItems": 5,
+                    "items": {"type": "string", "description": "便益を短く明快に述べた1行。"}
+                },
+                "features": {
+                    "type": "array",
+                    "description": "主な機能。5〜7項目。具体的・実務的な価値を示す。",
+                    "minItems": 5,
+                    "maxItems": 7,
+                    "items": {"type": "string", "description": "個別の機能説明（AWS構文の語彙を適宜使用）。"}
+                },
+                "integrations": {
+                    "type": "array",
+                    "description": "統合可能な（AWS風の）サービス名。5〜10個。",
+                    "minItems": 5,
+                    "maxItems": 10,
+                    "items": {"type": "string", "description": "例: IAM, VPC, CloudWatch, ALB, Lambda, S3, RDS, KMS, ECR 等。"}
+                },
+                "getting_started": {
+                    "type": "array",
+                    "description": "導入手順。4〜7ステップ。初期設定からデプロイ・監視まで。",
+                    "minItems": 4,
+                    "maxItems": 7,
+                    "items": {"type": "string", "description": "操作手順を簡潔に1文で。"}
+                },
+                "pricing": {
+                    "type": "array",
+                    "description": "料金説明。3〜5項目。課金単位や無料枠・別料金（転送料など）を明記。",
+                    "minItems": 3,
+                    "maxItems": 5,
+                    "items": {"type": "string", "description": "料金の観点（課金要素/無料枠/注意点）。"}
+                },
+                "sample_cli": {
+                    "type": "string",
+                    "description": "CLIの使用例。コードフェンス無しの平文1ブロック。"
+                },
+                "faqs": {
+                    "type": "array",
+                    "description": "FAQ配列。3〜5項目。",
+                    "minItems": 3,
+                    "maxItems": 5,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "description": "FAQの1項目（QとA）。",
+                        "properties": {
+                            "q": {"type": "string", "description": "質問文。具体的で検索されやすい表現。"},
+                            "a": {"type": "string", "description": "回答文。余計な免責や前置きは避け、端的に答える。"}
+                        },
+                        "required": ["q", "a"]
+                    }
+                }
+            },
+            "required": [
+                "service_name", "tagline", "summary",
+                "highlights", "features", "integrations",
+                "getting_started", "pricing", "sample_cli", "faqs"
+            ]
+        }
+    }
+
+
+# =========================
+#  プロンプト
+# =========================
 
 def build_prompt(term: str, lang: str, tone: str) -> str:
     '''関数の説明
-    任意の単語 (term) から AWS 構文のパロディ説明 JSON を生成するためのプロンプト文字列を組み立てる。
-    lang は "ja" または "en"。tone は文章の盛り具合（例: "standard" / "overkill"）。
+    生成内容（意味論）だけを指示。形式・制約は JSON Schema に委譲する。
     '''
-    # 日本語・英語での出力条件を切り替える
     if lang == "ja":
-        lang_inst = (
-            "出力は必ず日本語。"
-        )
-        # 遊びを少しだけ
+        lang_inst = "出力言語は日本語。"
         spice = "やや誇張して" if tone == "standard" else "強めに誇張して"
     else:
-        lang_inst = (
-            "Output must be in English."
-        )
+        lang_inst = "Output language is English."
         spice = "with a slightly grand tone" if tone == "standard" else "with an aggressively grand tone"
 
-    # JSON 以外の文字を出さないように厳命
-    prompt = f"""
-You are an expert AWS product marketer and solutions architect.
-Write a **parody** AWS-style service page description in strict JSON (no markdown, no commentary, no code fences).
-
-Constraints:
-- Style: official AWS documentation tone ("AWS構文"): fully managed, scalable, secure, integrated, high availability, reliability, seamless integration, etc.
-- It is a parody for the arbitrary term: "{term}" (make it sound like a real AWS service).
-- Create a plausible AWS-like name (e.g., "AWS Elastic <Term>" or "Amazon <Term> Service").
-- DO NOT include real legal claims; keep it fictional but believable.
-- {lang_inst}
-- Return **ONLY** valid JSON per the schema below. No extra keys. No trailing commas. No markdown code fences.
-
-Tone: {spice}
-
-Schema (JSON keys only):
-{{
-  "service_name": string,
-  "tagline": string,
-  "summary": string,
-  "highlights": [string, ...],
-  "features": [string, ...],
-  "integrations": [string, ...],
-  "getting_started": [string, ...],
-  "pricing": [string, ...],
-  "sample_cli": string,
-  "faqs": [{{"q": string, "a": string}}, ...]
-}}
-
-Quality bar:
-- "highlights": 3-5 bullets
-- "features": 5-7 bullets
-- "integrations": 5-10 realistic AWS services (ALB, IAM, VPC, CloudWatch, Lambda, S3, RDS, etc.), or equivalents if language is Japanese
-- "getting_started": 4-7 steps
-- "pricing": 3-5 bullets with free tier-ish note
-- "sample_cli": plausible CLI showing create/deploy using the service name; no backticks
-- "faqs": 3-5 Q&A items
-
-Again, respond with STRICT JSON ONLY.
-"""
-    return prompt.strip()
+    return (
+        "You are an expert AWS product marketer and solutions architect. "
+        "Create a *parody* AWS-style product page description for the arbitrary term below, "
+        "in the tone of official AWS docs (fully managed, scalable, secure, highly available, seamless integrations). "
+        f"Arbitrary term: {term}\n"
+        f"{lang_inst}\n"
+        f"Tone: {spice}\n"
+        "Do not include legal claims or real SLAs; keep it fictional but plausible.\n"
+        "Fill every field in the provided JSON Schema faithfully."
+    )
 
 
-class LLMClient:
+# =========================
+#  OpenAI クライアント（Responses API + Structured Outputs）
+# =========================
+
+class OpenAIResponsesClient:
     '''関数の説明
-    LLM へのインターフェースを抽象化するための基底クラス。
+    Responses API（Structured Outputs）で JSON 構造を厳密に取得するクライアント。
     '''
-
-    def generate(self, prompt: str, temperature: float = 0.7, max_tokens: int = 900) -> str:
-        '''関数の説明
-        実装クラスでプロンプトからテキストを生成する。戻り値は LLM の生テキスト。
-        '''
-        raise NotImplementedError
-
-
-class OpenAILLMClient(LLMClient):
-    '''関数の説明
-    OpenAI API を用いた LLM クライアント。openai>=1.x を想定。
-    '''
-
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
-        # 日本語コメント：OpenAI クライアントの初期化
-        if not OPENAI_AVAILABLE:
-            raise RuntimeError("openai ライブラリが利用できません。requirements を確認してください。")
         self.client = OpenAI(api_key=api_key)
         self.model = model
 
-    def generate(self, prompt: str, temperature: float = 0.7, max_tokens: int = 900) -> str:
+    def _extract_output_text(self, resp) -> str:
         '''関数の説明
-        OpenAI Chat Completions 互換 API を叩いてテキストを生成する。
+        Responses API の戻りからテキスト出力を抽出する。
+        output_text があればそれを、なければ output 配列を走査。
         '''
-        # 日本語コメント：モデル名は環境変数で差し替え可能にする
-        resp = self.client.chat.completions.create(
+        text = getattr(resp, "output_text", None)
+        if text:
+            return text
+
+        pieces = []
+        for item in getattr(resp, "output", []) or []:
+            for c in getattr(item, "content", []) or []:
+                t = getattr(c, "text", None)
+                if t:
+                    pieces.append(t)
+        if pieces:
+            return "\n".join(pieces)
+
+        # 取得できなければ JSON で返す（デバッグ用）
+        return resp.model_dump_json()
+
+    def generate(self, prompt: str, lang: str, temperature: float = 0.4, max_output_tokens: int = 1200) -> str:
+        '''関数の説明
+        Structured Outputs を使って生成し、厳格 JSON テキストを返す。
+        '''
+        schema = build_service_spec_json_schema(lang)
+
+        t0 = time.perf_counter()
+        _log("info", "openai.request",
+             model=self.model, temperature=temperature, max_output_tokens=max_output_tokens)
+
+        # ✅ instructions は“システム文”、input はプレーン文字列（messages ではない）
+        resp = self.client.responses.create(
             model=self.model,
+            instructions="You return only structured data defined by the provided JSON Schema. No prefaces.",
+            input=prompt,
             temperature=temperature,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=max_tokens,
+            max_output_tokens=max_output_tokens,
+            response_format={
+                "type": "json_schema",
+                "json_schema": schema  # {"name","schema","strict"} を含む
+            },
         )
-        return resp.choices[0].message.content
+
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+        usage = getattr(resp, "usage", None)
+        usage_dict = None
+        if usage:
+            try:
+                usage_dict = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
+            except Exception:
+                usage_dict = None
+
+        _log("info", "openai.response",
+             response_id=getattr(resp, "id", None),
+             model=self.model,
+             latency_ms=dt_ms,
+             usage=usage_dict)
+
+        text = self._extract_output_text(resp)
+        return text
 
 
-class DummyLLMClient(LLMClient):
-    '''関数の説明
-    オフラインでも動作確認ができるダミー LLM クライアント。
-    入力単語から決め打ちの JSON を返す。
-    '''
-
-    def generate(self, prompt: str, temperature: float = 0.7, max_tokens: int = 900) -> str:
-        '''関数の説明
-        ダミー応答を JSON 文字列として返す。
-        '''
-        # 日本語コメント：プロンプトから term を雑に抽出（デモ用）
-        m = re.search(r'term:\s*"([^"]+)"', prompt)
-        term = m.group(1) if m else "サンプル"
-
-        service_name = f"AWS Elastic {term}".strip()
-        sample = {
-            "service_name": service_name,
-            "tagline": f"{term} を、クラウド級の可用性で。",
-            "summary": f"{service_name} は、{term} のライフサイクルをフルマネージドで最適化し、スケーラブルでセキュアな運用を容易にします。AWS の信頼性と統合により、設計から運用、可観測性までを一貫して提供します。",
-            "highlights": [
-                "フルマネージドで運用負荷を大幅削減",
-                "需要に応じた自動スケーリング",
-                "IAM と統合したロールベースアクセス制御",
-                "VPC 内でのセキュアな分離実行"
-            ],
-            "features": [
-                "高可用なコントロールプレーンで {term} をオーケストレーション",
-                "CloudWatch によるメトリクス/ログの一元監視",
-                "ALB 連携でトラフィックをインテリジェントに分配",
-                "Fargate/EC2 いずれのワークロードでも動作",
-                "Well-Architected に準拠したリファレンス実装"
-            ],
-            "integrations": ["IAM", "VPC", "CloudWatch", "ALB", "Lambda", "S3", "RDS", "KMS", "ECR"],
-            "getting_started": [
-                "AWS アカウントで本サービスを有効化",
-                f"必要な IAM ロールを作成し {term} 用ポリシーを適用",
-                "VPC/サブネット/セキュリティグループを設定",
-                f"{term} のワークロード定義を登録してデプロイ",
-                "CloudWatch でメトリクスとログを確認"
-            ],
-            "pricing": [
-                "コントロールプレーン課金 + 実行リソースの従量課金",
-                "データ転送料金は別途適用",
-                "無料利用枠: 月間 {term} ジョブ 100 回相当まで"
-            ],
-            "sample_cli": f"aws elastic-{term}-service create --name demo --replicas 3 --region ap-northeast-1",
-            "faqs": [
-                {"q": "オンプレミスでも動きますか？", "a": "はい。AWS Outposts やハイブリッド構成に対応します。"},
-                {"q": "スケーリングの指標は？", "a": "CPU/メモリ/カスタムメトリクスに基づくポリシーを設定できます。"},
-                {"q": "セキュリティは？", "a": "IAM/KMS/PrivateLink など標準機能と統合されています。"}
-            ],
-        }
-        # 日本語コメント：{term} を実値で置換
-        sample["features"][0] = sample["features"][0].format(term=term)
-        return json.dumps(sample, ensure_ascii=False)
-
-
-def get_llm_client() -> LLMClient:
-    '''関数の説明
-    環境変数から LLM の種別を判断し、適切なクライアントを返す。
-    OPENAI_API_KEY があれば OpenAI を、なければ Dummy。
-    '''
-    api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    if api_key and OPENAI_AVAILABLE:
-        return OpenAILLMClient(api_key=api_key, model=model)
-    return DummyLLMClient()
-
-
-def coerce_json(text: str) -> dict:
-    '''関数の説明
-    LLM の出力から不要なバッククォートやプレフィックスを除去し、厳密に JSON として読み込む。
-    '''
-    # 日本語コメント：コードフェンスの除去
-    text = text.strip()
-    text = re.sub(r"^```json\s*|\s*```$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```|\s*```$", "", text)
-    # 日本語コメント：先頭に余計な説明文が混ざった場合に最初の { から末尾の } までを抽出
-    m = re.search(r"{.*}", text, flags=re.DOTALL)
-    if m:
-        text = m.group(0)
-    return json.loads(text)
-
+# =========================
+#  ルーティング
+# =========================
 
 @app.get("/")
 def index():
@@ -245,35 +293,98 @@ def api_generate():
     lang = (data.get("lang") or "ja").strip().lower()
     tone = (data.get("tone") or "standard").strip().lower()
 
-    # 日本語コメント：最小バリデーション
+    _log("info", "http.request", path="/api/generate", method="POST", lang=lang, tone=tone)
+
+    # 最小バリデーション
     if not term:
+        _log("error", "validation.error", reason="term missing")
         return jsonify({"error": "term は必須です"}), 400
     if lang not in ("ja", "en"):
+        _log("error", "validation.error", reason="invalid lang", value=lang)
         return jsonify({"error": "lang は 'ja' または 'en' を指定してください"}), 400
     if tone not in ("standard", "overkill"):
+        _log("error", "validation.error", reason="invalid tone", value=tone)
         return jsonify({"error": "tone は 'standard' または 'overkill' を指定してください"}), 400
 
-    # 日本語コメント：プロンプト作成 → 生成
     prompt = build_prompt(term=term, lang=lang, tone=tone)
-    client = get_llm_client()
+
+    # OpenAI クライアント初期化
+    api_key = os.getenv("OPENAI_API_KEY")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    if not api_key:
+        _log("error", "config.error", reason="OPENAI_API_KEY not set")
+        return jsonify({"error": "サーバ設定エラー: OPENAI_API_KEY が未設定です"}), 500
+
+    client = OpenAIResponsesClient(api_key=api_key, model=model)
+
     try:
-        raw = client.generate(prompt)
-        obj = coerce_json(raw)
-        spec = ServiceSpec.model_validate(obj)
-    except ValidationError as ve:
-        return jsonify({"error": "LLM 出力の検証に失敗しました", "detail": ve.errors()}), 500
+        text = client.generate(prompt, lang=lang)
+        obj = json.loads(text)  # Structured Outputs なので厳密 JSON のはず
+        spec = ServiceSpec.model_validate(obj)  # 念のためPydanticでも検証
+        _log("info", "generation.success", term=term, lang=lang, tone=tone)
+        return jsonify(spec.model_dump())
+
+    # ---------- OpenAI 由来のエラー ----------
+    except RateLimitError as e:
+        _log("error", "openai.error.rate_limit", message=str(e), trace=traceback.format_exc())
+        return jsonify({"error": "LLM呼び出しがレート制限に達しました。時間を置いて再試行してください。"}), 502
+
+    except APITimeoutError as e:
+        _log("error", "openai.error.timeout", message=str(e), trace=traceback.format_exc())
+        return jsonify({"error": "LLM応答がタイムアウトしました。"}), 502
+
+    except APIConnectionError as e:
+        _log("error", "openai.error.connection", message=str(e), trace=traceback.format_exc())
+        return jsonify({"error": "LLM接続エラーが発生しました。ネットワーク/エンドポイントを確認してください。"}), 502
+
+    except APIStatusError as e:
+        status = getattr(e, "status_code", None)
+        # ステータスコードに応じて人間可読メッセージを分岐
+        if status == 401:
+            _log("error", "openai.error.unauthorized", status_code=status, message=str(e), trace=traceback.format_exc())
+            return jsonify({"error": "LLM認証に失敗しました。APIキー設定を確認してください。"}), 502
+        elif status == 404:
+            _log("error", "openai.error.not_found", status_code=status, message=str(e), trace=traceback.format_exc())
+            return jsonify({"error": "指定のモデルやリソースが見つかりません。モデル名や設定を確認してください。"}), 502
+        elif status == 400:
+            _log("error", "openai.error.bad_request", status_code=status, message=str(e), trace=traceback.format_exc())
+            return jsonify({"error": "LLMへの要求が不正です。プロンプト/パラメータを見直してください。"}), 502
+        elif status == 422:
+            _log("error", "openai.error.unprocessable", status_code=status, message=str(e), trace=traceback.format_exc())
+            return jsonify({"error": "要求が処理できませんでした。JSON Schema の制約や複雑さを見直してください。"}), 502
+        elif status == 409:
+            _log("error", "openai.error.conflict", status_code=status, message=str(e), trace=traceback.format_exc())
+            return jsonify({"error": "競合エラーが発生しました。再試行してください。"}), 502
+        elif status and status >= 500:
+            _log("error", "openai.error.internal", status_code=status, message=str(e), trace=traceback.format_exc())
+            return jsonify({"error": "LLM側内部エラーが発生しました。"}), 502
+        else:
+            _log("error", "openai.error.status", status_code=status, message=str(e), trace=traceback.format_exc())
+            return jsonify({"error": f"LLM呼び出しでHTTPエラーが発生しました（status={status}）。"}), 502
+
+    except OpenAIError as e:
+        _log("error", "openai.error.generic", message=str(e), trace=traceback.format_exc())
+        return jsonify({"error": "LLM呼び出し中にエラーが発生しました。"}), 502
+
+    # ---------- JSON/Pydantic/その他 ----------
+    except ValidationError as e:
+        _log("error", "validation.error.pydantic", message=str(e), errors=e.errors(), trace=traceback.format_exc())
+        return jsonify({"error": "LLM出力の検証に失敗しました。"}), 502
+
+    except json.JSONDecodeError as e:
+        _log("error", "json.error.decode", message=str(e), trace=traceback.format_exc())
+        return jsonify({"error": "LLM出力が不正なJSONでした。"}), 502
+
     except Exception as e:
-        # 日本語コメント：LLM 側の不具合や整形失敗時もダミー応答でフォールバック
-        dummy = DummyLLMClient().generate(prompt)
-        obj = coerce_json(dummy)
-        spec = ServiceSpec.model_validate(obj)
+        _log("error", "server.error.unexpected", message=str(e), trace=traceback.format_exc())
+        return jsonify({"error": "不明なサーバエラーが発生しました。"}), 502
 
-    return jsonify(spec.model_dump())
 
+# =========================
+#  エントリポイント
+# =========================
 
 if __name__ == "__main__":
-    '''関数の説明
-    ローカル開発用のエントリポイント。ポートは PORT 環境変数で上書き可。
-    '''
     port = int(os.getenv("PORT", 5000))
+    _log("info", "server.start", port=port, env="production" if not app.debug else "debug")
     app.run(host="0.0.0.0", port=port, debug=True)
