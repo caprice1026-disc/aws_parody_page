@@ -7,6 +7,16 @@ document.addEventListener("DOMContentLoaded", () => {
   const tone = document.getElementById("tone");
   const statusEl = document.getElementById("status");
   const page = document.getElementById("page");
+  const button = document.getElementById("gen-btn");
+
+  // 日本語コメント：生成中のステータスメッセージを回すための配列
+  const loadingMessages = [
+    "生成中…（クラウドのはるか彼方でバズワードが攪拌されています）",
+    "生成中…（エッジロケーション在住の妖精がキャッシュを温めています）",
+    "生成中…（責任共有モデルの線引きを絶賛協議中…）",
+  ];
+  let loadingTimer = null;
+  let loadingIndex = 0;
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -15,11 +25,18 @@ document.addEventListener("DOMContentLoaded", () => {
       lang: lang.value,
       tone: tone.value,
     };
+
+    term.classList.remove("input-error");
+
     if (!payload.term) {
       statusEl.textContent = "単語を入れてください。";
+      term.classList.add("input-error");
+      term.focus();
       return;
     }
-    statusEl.textContent = "生成中…（クラウドのはるか彼方でバズワードが攪拌されています）";
+
+    setLoadingState(true);
+    startLoadingStatus();
 
     try {
       const res = await fetch("/api/generate", {
@@ -33,15 +50,54 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       const spec = await res.json();
       render(spec);
-      statusEl.textContent = "生成完了。";
+      stopLoadingStatus("生成完了。");
+      smoothScrollTo(page);
     } catch (err) {
       console.error(err);
-      statusEl.textContent = "生成に失敗しました。コンソールを確認してください。";
+      stopLoadingStatus("生成に失敗しました。コンソールを確認してください。");
+      showErrorState("⚠️ 生成に失敗しました。もう一度お試しください。");
+    } finally {
+      setLoadingState(false);
     }
   });
 
+  function startLoadingStatus() {
+    statusEl.classList.add("is-loading");
+    statusEl.textContent = loadingMessages[0];
+    loadingIndex = 0;
+    if (loadingTimer) clearInterval(loadingTimer);
+    loadingTimer = setInterval(() => {
+      loadingIndex = (loadingIndex + 1) % loadingMessages.length;
+      statusEl.textContent = loadingMessages[loadingIndex];
+    }, 2600);
+  }
+
+  function stopLoadingStatus(message) {
+    statusEl.classList.remove("is-loading");
+    if (loadingTimer) {
+      clearInterval(loadingTimer);
+      loadingTimer = null;
+    }
+    if (message) {
+      statusEl.textContent = message;
+    }
+  }
+
+  function setLoadingState(isLoading) {
+    if (isLoading) {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      showLoadingSkeleton();
+    } else {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
+  }
+
   /** 日本語コメント：受け取った JSON をレイアウトに挿入する（innerHTML は使わず XSS を回避） */
   function render(spec) {
+    page.classList.remove("loading");
+    page.classList.remove("ready");
     page.innerHTML = "";
 
     // タイトル
@@ -85,9 +141,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const faqWrap = el("div", { className: "section card" },
       el("h3", {}, txt("FAQ")));
     (spec.faqs || []).forEach(item => {
-      const q = el("p", { style: "font-weight:700;margin-bottom:4px" }, txt((item.q || "")));
-      const a = el("p", { style: "margin-top:0" }, txt((item.a || "")));
-      faqWrap.appendChild(q); faqWrap.appendChild(a);
+      const entry = el("div", { className: "faq-entry" },
+        el("p", { className: "faq-question" }, txt(item.q || "")),
+        el("p", { className: "faq-answer" }, txt(item.a || "")),
+      );
+      faqWrap.appendChild(entry);
     });
 
     page.appendChild(h1);
@@ -99,6 +157,10 @@ document.addEventListener("DOMContentLoaded", () => {
     page.appendChild(pricing);
     page.appendChild(cli);
     page.appendChild(faqWrap);
+
+    requestAnimationFrame(() => {
+      page.classList.add("ready");
+    });
   }
 
   // --------- ユーティリティ（innerHTML を使わない） ---------
@@ -132,5 +194,98 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   function getLang() {
     return document.getElementById("lang").value;
+  }
+  function showLoadingSkeleton() {
+    page.classList.remove("ready");
+    page.classList.add("loading");
+    page.innerHTML = "";
+
+    const heading = el("div", {},
+      skeletonBlock("60%", 26),
+      skeletonLine("40%", 16)
+    );
+    heading.style.marginBottom = "18px";
+    heading.style.display = "grid";
+    heading.style.gap = "12px";
+
+    const tagline = el("div", {},
+      skeletonLine("72%", 14),
+      skeletonLine("52%", 14)
+    );
+    tagline.style.marginBottom = "24px";
+    tagline.style.display = "grid";
+    tagline.style.gap = "10px";
+
+    const summary = skeletonCard();
+    const highlight = skeletonCard();
+    const grid = el("div", { className: "kv" }, summary, highlight);
+
+    const sections = [
+      skeletonSection(),
+      skeletonSection(),
+      skeletonSection(),
+      skeletonSection(),
+      skeletonSection(),
+      skeletonFaq(),
+    ];
+
+    page.appendChild(heading);
+    page.appendChild(tagline);
+    page.appendChild(grid);
+    sections.forEach(sec => page.appendChild(sec));
+  }
+
+  function showErrorState(message) {
+    page.classList.remove("loading");
+    page.classList.remove("ready");
+    page.innerHTML = "";
+    page.appendChild(el("div", { className: "placeholder error" }, txt(message)));
+  }
+
+  function skeletonLine(width, height = 12) {
+    const line = el("div", { className: "skeleton-line skeleton-shimmer" });
+    line.style.width = width;
+    line.style.height = `${height}px`;
+    return line;
+  }
+
+  function skeletonBlock(width, height = 18) {
+    const block = el("div", { className: "skeleton-block skeleton-shimmer" });
+    block.style.width = width;
+    block.style.height = `${height}px`;
+    return block;
+  }
+
+  function skeletonCard() {
+    const card = el("div", { className: "card skeleton-card" });
+    card.appendChild(skeletonBlock("55%", 18));
+    card.appendChild(skeletonLine("82%"));
+    card.appendChild(skeletonLine("68%"));
+    card.appendChild(skeletonLine("72%"));
+    return card;
+  }
+
+  function skeletonSection() {
+    const wrap = el("div", { className: "section card skeleton-card" });
+    wrap.appendChild(skeletonBlock("45%", 18));
+    wrap.appendChild(skeletonLine("86%"));
+    wrap.appendChild(skeletonLine("72%"));
+    wrap.appendChild(skeletonLine("64%"));
+    return wrap;
+  }
+
+  function skeletonFaq() {
+    const wrap = el("div", { className: "section card skeleton-card" });
+    wrap.appendChild(skeletonBlock("30%", 18));
+    wrap.appendChild(skeletonLine("90%"));
+    wrap.appendChild(skeletonLine("80%"));
+    wrap.appendChild(skeletonLine("70%"));
+    wrap.appendChild(skeletonLine("82%"));
+    return wrap;
+  }
+
+  function smoothScrollTo(node) {
+    if (!node) return;
+    node.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 });
